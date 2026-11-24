@@ -1,5 +1,14 @@
 //@version=6
-indicator("FVG + IFVG + Directional Bias + NY Levels + Market Structure", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+strategy("FVG + IFVG + Directional Bias + NY Levels + Market Structure Strategy",
+     overlay=true,
+     max_boxes_count=500,
+     max_lines_count=500,
+     max_labels_count=500,
+     max_bars_back=5000,
+     pyramiding=0,
+     default_qty_type=strategy.fixed,
+     default_qty_value=4,
+     process_orders_on_close=true)
 
 //====================================================
 // 1. SETTINGS
@@ -180,9 +189,28 @@ f_timeframeBias() =>
 
     bias
 
-int monthlyBias = request.security(syminfo.tickerid, "M", f_timeframeBias(), lookahead=barmerge.lookahead_off)
-int weeklyBias = request.security(syminfo.tickerid, "W", f_timeframeBias(), lookahead=barmerge.lookahead_off)
-int dailyBias = request.security(syminfo.tickerid, "D", f_timeframeBias(), lookahead=barmerge.lookahead_off)
+// IMPORTANT:
+// Use the previous completed higher-timeframe candle.
+// The [1] offset prevents lookahead bias while lookahead_on
+// makes the confirmed value available throughout the current period.
+
+int monthlyBias = request.security(
+     syminfo.tickerid,
+     "M",
+     f_timeframeBias()[1],
+     lookahead=barmerge.lookahead_on)
+
+int weeklyBias = request.security(
+     syminfo.tickerid,
+     "W",
+     f_timeframeBias()[1],
+     lookahead=barmerge.lookahead_on)
+
+int dailyBias = request.security(
+     syminfo.tickerid,
+     "D",
+     f_timeframeBias()[1],
+     lookahead=barmerge.lookahead_on)
 
 //====================================================
 // 6. DIRECTIONAL BIAS TABLE
@@ -1072,28 +1100,19 @@ var float activeTradeStop = na
 var float activeTradeRisk = na
 var int remainingContracts = 0
 
-// Preserve the original stop independently from the live stop.
-// This prevents trailing-stop changes from altering the original
-// structural target-range calculation.
 var float activeTradeInitialStop = na
 
-// Trailing-stop state.
 var bool activeTradeBreakEvenTriggered = false
 var bool activeTradeTrailPairReady = false
 var float activeTradeTrailBreakoutLevel = na
 var float activeTradeTrailProtectionLevel = na
 
-// Cumulative outstanding losses from prior trades.
 var float recoveryLossBalance = 0.0
-
-// Net realized P&L for the currently active trade.
 var float activeTradeRealizedPnL = 0.0
 
-// Recovery state for the current trade.
 var bool activeTradeRecoveryTriggered = false
 var float activeTradeRecoveryPrice = na
 
-// Structural reference used to calculate the four regular targets.
 var bool activeTradeReferenceFound = false
 var float activeTradeReferencePrice = na
 var int activeTradeReferenceBar = na
@@ -1110,7 +1129,7 @@ var array<label> activeTargetLabels = array.new_label()
 // 24. M1 ENTRY CONFIRMATION
 //====================================================
 
-if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxDailyAttempts and not activeTrade
+if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxDailyAttempts and not activeTrade and strategy.position_size == 0
     int selectedIndex = -1
 
     int count = array.size(candidateTops)
@@ -1125,7 +1144,6 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
             float bottom = array.get(candidateBottoms, i)
 
             bool bearishConfirmation = dailyBias == -1 and direction == 1 and close < bottom and bar_index > formationBar
-
             bool bullishConfirmation = dailyBias == 1 and direction == -1 and close > top and bar_index > formationBar
 
             if not used and (bearishConfirmation or bullishConfirmation)
@@ -1150,6 +1168,8 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
         int stopBarIndex = na
         string stopStructureType = ""
 
+        // direction == 1 means SHORT.
+        // Short stop must be above entry.
         if direction == 1
             if not na(structHH) and not na(structHH_idx) and structHH > entryPrice
                 stopPrice := structHH
@@ -1162,6 +1182,8 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
                     stopBarIndex := structLH_idx
                     stopStructureType := "LH"
 
+        // direction == -1 means LONG.
+        // Long stop must be below entry.
         else
             if not na(structHL) and not na(structHL_idx) and structHL < entryPrice
                 stopPrice := structHL
@@ -1174,16 +1196,25 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
                     stopBarIndex := structLL_idx
                     stopStructureType := "LL"
 
-        int stopBarsAgo = not na(stopBarIndex) ? bar_index - stopBarIndex : na
-
-        int stopStructureTime = not na(stopBarsAgo) and stopBarsAgo >= 0 and stopBarsAgo <= 4999 ? time[stopBarsAgo] : na
-
-        bool validStop = not na(stopPrice) and not na(stopBarIndex) and not na(stopStructureTime)
+        // A structural stop is mandatory.
+        // No candle fallback or fabricated stop is permitted.
+        bool validStop = not na(stopPrice) and
+             not na(stopBarIndex) and
+             (direction == 1 ? stopPrice > entryPrice : stopPrice < entryPrice)
 
         if validStop
             array.set(candidateUsed, selectedIndex, true)
 
             dailyAttemptCount += 1
+
+            //================================================
+            // SUBMIT FOUR-CONTRACT MARKET ENTRY
+            //================================================
+
+            if direction == 1
+                strategy.entry("Short", strategy.short, qty=FIXED_CONTRACTS, comment="Short Entry")
+            else
+                strategy.entry("Long", strategy.long, qty=FIXED_CONTRACTS, comment="Long Entry")
 
             //================================================
             // INITIALIZE FOUR-CONTRACT POSITION
@@ -1202,14 +1233,10 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
             activeTradeRecoveryTriggered := recoveryLossBalance <= 0
             activeTradeRecoveryPrice := na
 
-            // Reset trailing-stop state for the new trade.
             activeTradeBreakEvenTriggered := false
             activeTradeTrailPairReady := false
             activeTradeTrailBreakoutLevel := na
             activeTradeTrailProtectionLevel := na
-
-            // Seed the initial trailing structure from the
-            // currently active market structure, if qualified.
 
             if direction == -1 and lastStructure == "HH"
                 bool validInitialBullishPair = not na(structHH) and
@@ -1241,10 +1268,6 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
             activeTradeReferencePrice := na
             activeTradeReferenceBar := na
 
-            // Calculate recovery price for a two-contract exit.
-            // The distance is rounded away from entry to ensure
-            // the two-contract recovery proceeds reach the loss balance.
-
             if recoveryLossBalance > 0 and syminfo.pointvalue > 0
                 float recoveryDistance = recoveryLossBalance / (2.0 * syminfo.pointvalue)
                 float recoveryTicks = math.ceil(recoveryDistance / syminfo.mintick)
@@ -1262,7 +1285,7 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
             array.clear(activeTargetLabels)
 
             //================================================
-            // ORIGINAL ENTRY AND STOP DRAWINGS
+            // ENTRY AND STOP DRAWINGS
             //================================================
 
             color zoneColor = direction == 1 ? bullishColor : bearishColor
@@ -1309,7 +1332,7 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
             array.push(todayEntryLines, entryLine)
 
             line stopLine = line.new(
-                 x1=stopStructureTime,
+                 x1=time,
                  y1=stopPrice,
                  x2=nextMidnight,
                  y2=stopPrice,
@@ -1325,9 +1348,7 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
             string biasText = direction == 1 ? "DAILY BIAS: BEARISH" : "DAILY BIAS: BULLISH"
 
             string entryText = "ENTRY " + str.tostring(dailyAttemptCount) + "/3\n" + directionText + "\nENTRY: " + str.tostring(entryPrice, format.mintick) + "\nSIZE: 4 CONTRACTS"
-
             string stopText = "STOP LOSS (" + stopStructureType + ")\n" + str.tostring(stopPrice, format.mintick)
-
             string structureText = "SWEPT: " + sweptStructureType
 
             label entryLabel = label.new(
@@ -1344,7 +1365,7 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxD
             array.push(todayEntryLabels, entryLabel)
 
             label stopLabel = label.new(
-                 x=stopBarIndex,
+                 x=bar_index,
                  y=stopPrice,
                  text=stopText,
                  xloc=xloc.bar_index,
@@ -1432,7 +1453,6 @@ if isM1 and barstate.isconfirmed and activeTrade and not activeTradeReferenceFou
     bool validReference = not na(referencePrice) and not na(referenceBar) and referenceBar > activeTradeEntryBar
 
     if validReference
-        // Use the original stop, not the dynamically trailed stop.
         float structuralRange = math.abs(activeTradeInitialStop - referencePrice)
 
         if structuralRange > syminfo.mintick
@@ -1526,6 +1546,12 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
          low <= activeTradeStop
 
     if stopHit
+
+        strategy.close(
+             activeTradeDirection == 1 ? "Short" : "Long",
+             qty=remainingContracts,
+             comment="Structural Stop")
+
         float stopTradePnL = activeTradeDirection == 1 ?
              (activeTradeEntry - activeTradeStop) * remainingContracts * syminfo.pointvalue :
              (activeTradeStop - activeTradeEntry) * remainingContracts * syminfo.pointvalue
@@ -1555,6 +1581,7 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
         activeTrade := false
 
     else
+
         //================================================
         // FIRST PRIORITY: RECOVERY PARTIAL
         //================================================
@@ -1568,6 +1595,11 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
             if recoveryHit
                 int recoveryContracts = math.min(2, remainingContracts)
 
+                strategy.close(
+                     activeTradeDirection == 1 ? "Short" : "Long",
+                     qty=recoveryContracts,
+                     comment="Recovery Partial")
+
                 float recoveryProfit = activeTradeDirection == 1 ?
                      (activeTradeEntry - activeTradeRecoveryPrice) * recoveryContracts * syminfo.pointvalue :
                      (activeTradeRecoveryPrice - activeTradeEntry) * recoveryContracts * syminfo.pointvalue
@@ -1575,7 +1607,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                 activeTradeRealizedPnL += recoveryProfit
                 remainingContracts -= recoveryContracts
 
-                // The realized recovery amount offsets the outstanding loss.
                 recoveryLossBalance := math.max(0.0, recoveryLossBalance - recoveryProfit)
 
                 activeTradeRecoveryTriggered := true
@@ -1595,8 +1626,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                      textcolor=color.white,
                      size=size.normal)
 
-                // Any ordinary target already passed by price
-                // while recovery was active is no longer valid.
                 int targetCountAfterRecovery = array.size(activeTargetPrices)
 
                 if targetCountAfterRecovery > 0
@@ -1627,7 +1656,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
 
         //================================================
         // SECOND PRIORITY: ORIGINAL PARTIAL TARGETS
-        // Only active after recovery is complete.
         //================================================
 
         if activeTrade and (activeTradeRecoveryTriggered or recoveryLossBalance <= 0)
@@ -1646,6 +1674,11 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                         if targetTouched
                             int requestedQuantity = array.get(activeTargetQuantities, i)
                             int executedQuantity = math.min(requestedQuantity, remainingContracts)
+
+                            strategy.close(
+                                 activeTradeDirection == 1 ? "Short" : "Long",
+                                 qty=executedQuantity,
+                                 comment=array.get(activeTargetNames, i))
 
                             float targetProfit = activeTradeDirection == 1 ?
                                  (activeTradeEntry - targetPrice) * executedQuantity * syminfo.pointvalue :
@@ -1673,7 +1706,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                             line.set_color(targetLine, color.green)
                             line.set_style(targetLine, line.style_solid)
 
-            // All contracts have been closed.
             if remainingContracts <= 0
                 if activeTradeRealizedPnL < 0
                     recoveryLossBalance += math.abs(activeTradeRealizedPnL)
@@ -1698,30 +1730,9 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
 // 24C. STRUCTURAL BREAK-EVEN + TRAILING STOP
 //====================================================
 
-// This section runs after Section 24B.
-//
-// Therefore, a stop updated by a confirmed closing price
-// only becomes active from the NEXT candle.
-//
-// Direction encoding:
-//  -1 = LONG
-//   1 = SHORT
-//
-// LONG:
-//  1. Close above HH -> stop moves to entry.
-//  2. A subsequent HH/HL pair forms.
-//  3. Close above that HH -> stop moves to its HL.
-//
-// SHORT:
-//  1. Close below LL -> stop moves to entry.
-//  2. A subsequent LL/LH pair forms.
-//  3. Close below that LL -> stop moves to its LH.
-
-// Track whether the stop changed on this candle.
 bool structureStopChanged = false
 string structureStopReason = ""
 
-// Only evaluate on confirmed M1 candles after the entry candle.
 if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntryBar
 
     //================================================
@@ -1730,14 +1741,8 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
 
     if activeTradeDirection == -1
 
-        //================================================
-        // STAGE 1: WAIT FOR BREAK-EVEN CONFIRMATION
-        //================================================
-
         if not activeTradeBreakEvenTriggered
 
-            // Replace the currently tracked pair when a new
-            // confirmed bullish HH structure becomes available.
             if newHighStructureLabel and lastStructure == "HH"
 
                 activeTradeTrailPairReady := false
@@ -1754,7 +1759,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                     activeTradeTrailProtectionLevel := structHL
                     activeTradeTrailPairReady := true
 
-            // Only a confirmed CLOSE above the HH triggers BE.
             if activeTradeTrailPairReady and
                  not na(activeTradeTrailBreakoutLevel) and
                  close > activeTradeTrailBreakoutLevel
@@ -1766,19 +1770,12 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
 
                 activeTradeBreakEvenTriggered := true
 
-                // The initial HH/HL pair is consumed.
-                // A new structural pair is required for trailing.
                 activeTradeTrailPairReady := false
                 activeTradeTrailBreakoutLevel := na
                 activeTradeTrailProtectionLevel := na
 
-        //================================================
-        // STAGE 2: TRAIL TO THE NEXT CONFIRMED HL
-        //================================================
-
         else
 
-            // A new HH event provides the next HH/HL pair.
             if newHighStructureLabel and lastStructure == "HH"
 
                 activeTradeTrailPairReady := false
@@ -1795,8 +1792,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                     activeTradeTrailProtectionLevel := structHL
                     activeTradeTrailPairReady := true
 
-            // Only a confirmed CLOSE above the newly formed HH
-            // moves the stop to the HL belonging to that structure.
             if activeTradeTrailPairReady and
                  not na(activeTradeTrailBreakoutLevel) and
                  close > activeTradeTrailBreakoutLevel
@@ -1809,7 +1804,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                     structureStopChanged := true
                     structureStopReason := "TRAILING HL"
 
-                // Consume this pair after its breakout.
                 activeTradeTrailPairReady := false
                 activeTradeTrailBreakoutLevel := na
                 activeTradeTrailProtectionLevel := na
@@ -1820,14 +1814,8 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
 
     else if activeTradeDirection == 1
 
-        //================================================
-        // STAGE 1: WAIT FOR BREAK-EVEN CONFIRMATION
-        //================================================
-
         if not activeTradeBreakEvenTriggered
 
-            // Replace the currently tracked pair when a new
-            // confirmed bearish LL structure becomes available.
             if newLowStructureLabel and lastStructure == "LL"
 
                 activeTradeTrailPairReady := false
@@ -1844,7 +1832,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                     activeTradeTrailProtectionLevel := structLH
                     activeTradeTrailPairReady := true
 
-            // Only a confirmed CLOSE below the LL triggers BE.
             if activeTradeTrailPairReady and
                  not na(activeTradeTrailBreakoutLevel) and
                  close < activeTradeTrailBreakoutLevel
@@ -1856,19 +1843,12 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
 
                 activeTradeBreakEvenTriggered := true
 
-                // The initial LL/LH pair is consumed.
-                // A new structural pair is required for trailing.
                 activeTradeTrailPairReady := false
                 activeTradeTrailBreakoutLevel := na
                 activeTradeTrailProtectionLevel := na
 
-        //================================================
-        // STAGE 2: TRAIL TO THE NEXT CONFIRMED LH
-        //================================================
-
         else
 
-            // A new LL event provides the next LL/LH pair.
             if newLowStructureLabel and lastStructure == "LL"
 
                 activeTradeTrailPairReady := false
@@ -1885,8 +1865,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                     activeTradeTrailProtectionLevel := structLH
                     activeTradeTrailPairReady := true
 
-            // Only a confirmed CLOSE below the newly formed LL
-            // moves the stop to the LH belonging to that structure.
             if activeTradeTrailPairReady and
                  not na(activeTradeTrailBreakoutLevel) and
                  close < activeTradeTrailBreakoutLevel
@@ -1899,7 +1877,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
                     structureStopChanged := true
                     structureStopReason := "TRAILING LH"
 
-                // Consume this pair after its breakout.
                 activeTradeTrailPairReady := false
                 activeTradeTrailBreakoutLevel := na
                 activeTradeTrailProtectionLevel := na
@@ -1907,9 +1884,6 @@ if isM1 and barstate.isconfirmed and activeTrade and bar_index > activeTradeEntr
 //====================================================
 // 24D. UPDATE EXISTING STOP DRAWINGS
 //====================================================
-
-// Only modify the existing stop drawings when the live stop
-// has actually moved. Do not create replacement lines or labels.
 
 if structureStopChanged
 
