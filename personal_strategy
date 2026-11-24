@@ -1,5 +1,5 @@
 
- // @version=6
+ //@version=6
 indicator("FVG + IFVG + Directional Bias + NY Levels + Market Structure", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
 
 //====================================================
@@ -18,6 +18,8 @@ bool showBiasTable = input.bool(true, "Show Directional Bias Table")
 
 int leftLen = input.int(20, "Market Structure Left Length", minval=1)
 int rightLen = input.int(2, "Market Structure Right Length", minval=1)
+
+int maxDailyAttempts = 3
 
 color structureLabelColor = input.color(color.gray, "Structure Label Text Color")
 
@@ -52,6 +54,7 @@ bool isM1 = timeframe.isminutes and timeframe.multiplier == 1
 bool isDailyChart = timeframe.isdaily
 bool isWeeklyChart = timeframe.isweekly
 bool isMonthlyChart = timeframe.ismonthly
+
 bool isBiasChart = isDailyChart or isWeeklyChart or isMonthlyChart
 
 int nyYear = year(time, TZ)
@@ -96,26 +99,8 @@ float bearBottom = bearishFVG ? high : na
 float bearMid = bearishFVG ? (bearTop + bearBottom) / 2.0 : na
 
 //====================================================
-// 5. MONTHLY / WEEKLY / DAILY BIAS
+// 5. MONTHLY / WEEKLY / DAILY DIRECTIONAL BIAS
 //====================================================
-
-// Each FVG maintains its own direction.
-//
-// Original bullish FVG:
-// Close above midpoint = bullish.
-// Close below midpoint = bearish IFVG.
-//
-// Original bearish FVG:
-// Close below midpoint = bearish.
-// Close above midpoint = bullish IFVG.
-//
-// BIAS SELECTION:
-// 1. Find the FVG the latest confirmed candle closed inside.
-// 2. If it closed inside none, find the nearest FVG to that close.
-// 3. Use that FVG's current direction for directional bias.
-//
-// The live candle's current-price FVG is handled separately
-// in the chart display section.
 
 f_timeframeBias() =>
     var array<float> tops = array.new_float()
@@ -124,7 +109,7 @@ f_timeframeBias() =>
     var array<int> originalDirections = array.new_int()
     var array<int> currentDirections = array.new_int()
 
-    var int bias = 0
+    var int bias = -1
 
     bool isSunday = dayofweek(time, TZ) == dayofweek.sunday
     bool priorIsSunday = dayofweek(time[1], TZ) == dayofweek.sunday
@@ -161,23 +146,37 @@ f_timeframeBias() =>
                 else if close < midpoint
                     array.set(currentDirections, i, -1)
 
-            int selectedIndex = -1
-            float selectedDistance = na
+        int nearestIFVG = -1
+        float nearestIFVGDistance = na
 
-            // Prefer the most recently created FVG when
-            // multiple FVGs contain the confirmed close.
-            for i = count - 1 to 0
+        int nearestAny = -1
+        float nearestAnyDistance = na
+
+        if count > 0
+            for i = 0 to count - 1
                 float top = array.get(tops, i)
                 float bottom = array.get(bottoms, i)
 
+                int original = array.get(originalDirections, i)
+                int current = array.get(currentDirections, i)
+
                 float distance = close > top ? close - top : close < bottom ? bottom - close : 0.0
 
-                if na(selectedDistance) or distance < selectedDistance
-                    selectedDistance := distance
-                    selectedIndex := i
+                bool isInverted = original != current
 
-            if selectedIndex >= 0
-                bias := array.get(currentDirections, selectedIndex)
+                if na(nearestAnyDistance) or distance < nearestAnyDistance
+                    nearestAnyDistance := distance
+                    nearestAny := i
+
+                if isInverted
+                    if na(nearestIFVGDistance) or distance < nearestIFVGDistance
+                        nearestIFVGDistance := distance
+                        nearestIFVG := i
+
+        if nearestIFVG >= 0
+            bias := array.get(currentDirections, nearestIFVG)
+        else if nearestAny >= 0
+            bias := array.get(currentDirections, nearestAny)
 
     bias
 
@@ -214,7 +213,7 @@ if barstate.islast and not showBiasTable
     table.clear(biasTable, 0, 0, 1, 3)
 
 //====================================================
-// 7. CHART-TIMEFRAME FVG STORAGE
+// 7. HISTORICAL FVG STORAGE
 //====================================================
 
 var array<float> chartTops = array.new_float()
@@ -243,7 +242,7 @@ if isBiasChart and barstate.isconfirmed
         array.push(chartLeftTimes, time[2])
 
 //====================================================
-// 8. UPDATE INDIVIDUAL FVG DIRECTIONS
+// 8. UPDATE FVG DIRECTION ON CONFIRMED CLOSE
 //====================================================
 
 if isBiasChart and barstate.isconfirmed
@@ -259,13 +258,19 @@ if isBiasChart and barstate.isconfirmed
                 array.set(chartCurrentDirections, i, -1)
 
 //====================================================
-// 9. FIND FVG CONTAINING A PRICE OR NEAREST FVG
+// 9. FVG SELECTION HELPERS
 //====================================================
 
-f_nearestFvg(
+f_distanceToZone(float price, float top, float bottom) =>
+    price > top ? price - top : price < bottom ? bottom - price : 0.0
+
+f_nearestDirection(
      array<float> tops,
      array<float> bottoms,
-     float price) =>
+     array<int> directions,
+     int direction,
+     float price,
+     int excludedIndex) =>
 
     int bestIndex = -1
     float bestDistance = na
@@ -273,164 +278,232 @@ f_nearestFvg(
     int count = array.size(tops)
 
     if count > 0
-        for i = count - 1 to 0
-            float top = array.get(tops, i)
-            float bottom = array.get(bottoms, i)
+        for i = 0 to count - 1
+            if i != excludedIndex and array.get(directions, i) == direction
+                float top = array.get(tops, i)
+                float bottom = array.get(bottoms, i)
+                float distance = f_distanceToZone(price, top, bottom)
 
-            float distance = price > top ? price - top : price < bottom ? bottom - price : 0.0
-
-            if na(bestDistance) or distance < bestDistance
-                bestDistance := distance
-                bestIndex := i
+                if na(bestDistance) or distance < bestDistance
+                    bestDistance := distance
+                    bestIndex := i
 
     bestIndex
 
-f_containingFvg(
+f_nearestAny(
      array<float> tops,
      array<float> bottoms,
-     float price) =>
+     float price,
+     int excludedIndex) =>
 
     int bestIndex = -1
+    float bestDistance = na
+
     int count = array.size(tops)
 
     if count > 0
-        for i = count - 1 to 0
-            float top = array.get(tops, i)
-            float bottom = array.get(bottoms, i)
+        for i = 0 to count - 1
+            if i != excludedIndex
+                float top = array.get(tops, i)
+                float bottom = array.get(bottoms, i)
+                float distance = f_distanceToZone(price, top, bottom)
 
-            if price <= top and price >= bottom
-                bestIndex := i
-                break
+                if na(bestDistance) or distance < bestDistance
+                    bestDistance := distance
+                    bestIndex := i
 
     bestIndex
 
 //====================================================
-// 10. TWO HTF DISPLAY SLOTS
+// 10. TWO DISPLAY SLOTS
 //====================================================
 
-// Slot 1: FVG selected by the latest confirmed close.
-// Slot 2: FVG containing the current live price.
-//
-// This allows the weekly chart to show the bullish FVG
-// the previous candle closed inside AND a different
-// IFVG containing the current, still-forming candle.
+var box primaryDisplayBox = na
+var line primaryDisplayLine = na
 
-var box biasDisplayBox = na
-var line biasDisplayLine = na
-
-var box liveDisplayBox = na
-var line liveDisplayLine = na
+var box secondaryDisplayBox = na
+var line secondaryDisplayLine = na
 
 //====================================================
-// 11. DISPLAY BIAS FVG AND CURRENT-PRICE FVG
+// 11. DISPLAY THE RELEVANT TWO FVGs
 //====================================================
 
 if isBiasChart and barstate.islast
+    int primaryIndex = -1
+    int secondaryIndex = -1
+
+    float currentPrice = close
     float previousClose = close[1]
 
-    int biasIndex = not na(previousClose) ? f_nearestFvg(chartTops, chartBottoms, previousClose) : -1
-    int liveIndex = f_containingFvg(chartTops, chartBottoms, close)
+    int count = array.size(chartTops)
 
-    if not na(biasDisplayBox)
-        box.delete(biasDisplayBox)
-        biasDisplayBox := na
+    if count > 0
+        for i = count - 1 to 0
+            float top = array.get(chartTops, i)
+            float bottom = array.get(chartBottoms, i)
 
-    if not na(biasDisplayLine)
-        line.delete(biasDisplayLine)
-        biasDisplayLine := na
+            bool livePriceInside = currentPrice <= top and currentPrice >= bottom
 
-    if not na(liveDisplayBox)
-        box.delete(liveDisplayBox)
-        liveDisplayBox := na
+            if livePriceInside
+                primaryIndex := i
+                break
 
-    if not na(liveDisplayLine)
-        line.delete(liveDisplayLine)
-        liveDisplayLine := na
+    if primaryIndex == -1 and count > 0 and not na(previousClose)
+        for i = count - 1 to 0
+            float top = array.get(chartTops, i)
+            float bottom = array.get(chartBottoms, i)
 
-    // BIAS FVG: selected using the previous confirmed close.
-    if biasIndex >= 0
-        float top = array.get(chartTops, biasIndex)
-        float bottom = array.get(chartBottoms, biasIndex)
-        float mid = array.get(chartMids, biasIndex)
-        int leftTime = array.get(chartLeftTimes, biasIndex)
+            bool previousCloseInside = previousClose <= top and previousClose >= bottom
 
-        int originalDirection = array.get(chartOriginalDirections, biasIndex)
-        int currentDirection = array.get(chartCurrentDirections, biasIndex)
+            if previousCloseInside
+                primaryIndex := i
+                break
+
+    if primaryIndex == -1
+        int biasDirection = dailyBias
+
+        if timeframe.isweekly
+            biasDirection := weeklyBias
+        else if timeframe.ismonthly
+            biasDirection := monthlyBias
+
+        primaryIndex := f_nearestDirection(
+             chartTops,
+             chartBottoms,
+             chartCurrentDirections,
+             biasDirection,
+             currentPrice,
+             -1)
+
+        if primaryIndex == -1
+            primaryIndex := f_nearestAny(chartTops, chartBottoms, currentPrice, -1)
+
+    if primaryIndex >= 0
+        float primaryTop = array.get(chartTops, primaryIndex)
+        float primaryBottom = array.get(chartBottoms, primaryIndex)
+        int primaryDirection = array.get(chartCurrentDirections, primaryIndex)
+
+        if currentPrice > primaryTop
+            secondaryIndex := f_nearestDirection(
+                 chartTops,
+                 chartBottoms,
+                 chartCurrentDirections,
+                 -primaryDirection,
+                 currentPrice,
+                 primaryIndex)
+
+        else if currentPrice < primaryBottom
+            secondaryIndex := f_nearestDirection(
+                 chartTops,
+                 chartBottoms,
+                 chartCurrentDirections,
+                 primaryDirection,
+                 currentPrice,
+                 primaryIndex)
+
+        else
+            secondaryIndex := f_nearestAny(
+                 chartTops,
+                 chartBottoms,
+                 currentPrice,
+                 primaryIndex)
+
+        if secondaryIndex == -1
+            secondaryIndex := f_nearestAny(
+                 chartTops,
+                 chartBottoms,
+                 currentPrice,
+                 primaryIndex)
+
+    if not na(primaryDisplayBox)
+        box.delete(primaryDisplayBox)
+        primaryDisplayBox := na
+
+    if not na(primaryDisplayLine)
+        line.delete(primaryDisplayLine)
+        primaryDisplayLine := na
+
+    if not na(secondaryDisplayBox)
+        box.delete(secondaryDisplayBox)
+        secondaryDisplayBox := na
+
+    if not na(secondaryDisplayLine)
+        line.delete(secondaryDisplayLine)
+        secondaryDisplayLine := na
+
+    if primaryIndex >= 0
+        float top = array.get(chartTops, primaryIndex)
+        float bottom = array.get(chartBottoms, primaryIndex)
+        float mid = array.get(chartMids, primaryIndex)
+        int leftTime = array.get(chartLeftTimes, primaryIndex)
+
+        int originalDirection = array.get(chartOriginalDirections, primaryIndex)
+        int currentDirection = array.get(chartCurrentDirections, primaryIndex)
 
         bool isInverted = originalDirection != currentDirection
 
-        bool shouldShow = isInverted ? showIFVG : originalDirection == 1 ? showBullishFVG : showBearishFVG
+        color fillColor = isInverted ? invertedColor : currentDirection == 1 ? bullishColor : bearishColor
 
-        if shouldShow
-            color zoneFill = isInverted ? invertedColor : currentDirection == 1 ? bullishColor : bearishColor
-            color zoneBorder = previousCloseHighlightColor
-            color zoneMid = previousCloseHighlightColor
+        primaryDisplayBox := box.new(
+             left=leftTime,
+             top=top,
+             right=time,
+             bottom=bottom,
+             xloc=xloc.bar_time,
+             extend=extend.right,
+             bgcolor=fillColor,
+             border_color=previousCloseHighlightColor,
+             border_width=3)
 
-            biasDisplayBox := box.new(
-                 left=leftTime,
-                 top=top,
-                 right=time,
-                 bottom=bottom,
+        if showMidpoints
+            primaryDisplayLine := line.new(
+                 x1=leftTime,
+                 y1=mid,
+                 x2=time,
+                 y2=mid,
                  xloc=xloc.bar_time,
                  extend=extend.right,
-                 bgcolor=zoneFill,
-                 border_color=zoneBorder,
-                 border_width=3)
+                 color=previousCloseHighlightColor,
+                 style=line.style_dashed,
+                 width=2)
 
-            if showMidpoints
-                biasDisplayLine := line.new(
-                     x1=leftTime,
-                     y1=mid,
-                     x2=time,
-                     y2=mid,
-                     xloc=xloc.bar_time,
-                     extend=extend.right,
-                     color=zoneMid,
-                     style=line.style_dashed,
-                     width=2)
+    if secondaryIndex >= 0
+        float top = array.get(chartTops, secondaryIndex)
+        float bottom = array.get(chartBottoms, secondaryIndex)
+        float mid = array.get(chartMids, secondaryIndex)
+        int leftTime = array.get(chartLeftTimes, secondaryIndex)
 
-    // LIVE FVG: only draw if current price is inside one.
-    // Do not replace the confirmed-close bias FVG.
-    if liveIndex >= 0 and liveIndex != biasIndex
-        float top = array.get(chartTops, liveIndex)
-        float bottom = array.get(chartBottoms, liveIndex)
-        float mid = array.get(chartMids, liveIndex)
-        int leftTime = array.get(chartLeftTimes, liveIndex)
-
-        int originalDirection = array.get(chartOriginalDirections, liveIndex)
-        int currentDirection = array.get(chartCurrentDirections, liveIndex)
+        int originalDirection = array.get(chartOriginalDirections, secondaryIndex)
+        int currentDirection = array.get(chartCurrentDirections, secondaryIndex)
 
         bool isInverted = originalDirection != currentDirection
 
-        bool shouldShow = isInverted ? showIFVG : originalDirection == 1 ? showBullishFVG : showBearishFVG
+        color fillColor = isInverted ? invertedColor : currentDirection == 1 ? bullishColor : bearishColor
+        color borderColor = isInverted ? color.orange : currentDirection == 1 ? color.green : color.red
+        color midpointColor = isInverted ? invertedMidColor : currentDirection == 1 ? bullishMidColor : bearishMidColor
 
-        if shouldShow
-            color zoneFill = isInverted ? invertedColor : currentDirection == 1 ? bullishColor : bearishColor
-            color zoneBorder = isInverted ? color.orange : currentDirection == 1 ? color.green : color.red
-            color zoneMid = isInverted ? invertedMidColor : currentDirection == 1 ? bullishMidColor : bearishMidColor
+        secondaryDisplayBox := box.new(
+             left=leftTime,
+             top=top,
+             right=time,
+             bottom=bottom,
+             xloc=xloc.bar_time,
+             extend=extend.right,
+             bgcolor=fillColor,
+             border_color=borderColor,
+             border_width=1)
 
-            liveDisplayBox := box.new(
-                 left=leftTime,
-                 top=top,
-                 right=time,
-                 bottom=bottom,
+        if showMidpoints
+            secondaryDisplayLine := line.new(
+                 x1=leftTime,
+                 y1=mid,
+                 x2=time,
+                 y2=mid,
                  xloc=xloc.bar_time,
                  extend=extend.right,
-                 bgcolor=zoneFill,
-                 border_color=zoneBorder,
-                 border_width=2)
-
-            if showMidpoints
-                liveDisplayLine := line.new(
-                     x1=leftTime,
-                     y1=mid,
-                     x2=time,
-                     y2=mid,
-                     xloc=xloc.bar_time,
-                     extend=extend.right,
-                     color=zoneMid,
-                     style=line.style_dashed,
-                     width=1)
+                 color=midpointColor,
+                 style=line.style_dashed,
+                 width=1)
 
 //====================================================
 // 12. OTHER TIMEFRAMES: DISPLAY ALL FVGs
@@ -482,8 +555,14 @@ if not isM1 and not isBiasChart and barstate.isconfirmed
                  style=line.style_dashed)
 
 //====================================================
-// 13. MARKET STRUCTURE VARIABLES
-//     DECLARED BEFORE SWEEP LOGIC
+// 13. MARKET STRUCTURE PIVOTS
+//====================================================
+
+float ph = ta.pivothigh(high, leftLen, rightLen)
+float pl = ta.pivotlow(low, leftLen, rightLen)
+
+//====================================================
+// 14. MARKET STRUCTURE VARIABLES
 //====================================================
 
 var float structHH = na
@@ -510,13 +589,6 @@ var float firstLowValue = na
 
 var int firstHighIdx = na
 var int firstLowIdx = na
-
-//====================================================
-// 14. MARKET STRUCTURE PIVOTS
-//====================================================
-
-float ph = ta.pivothigh(high, leftLen, rightLen)
-float pl = ta.pivotlow(low, leftLen, rightLen)
 
 //====================================================
 // 15. INITIAL MARKET STRUCTURE
@@ -546,6 +618,7 @@ if barstate.isconfirmed and lastStructure == ""
             if showMarketStructure
                 label.new(structLH_idx, structLH, "LH", style=label.style_label_down, color=colorLH, textcolor=structureLabelColor)
                 label.new(structLL_idx, structLL, "LL", style=label.style_label_up, color=colorLL, textcolor=structureLabelColor)
+
         else
             structHL := firstLowValue
             structHL_idx := firstLowIdx
@@ -564,12 +637,12 @@ if barstate.isconfirmed and lastStructure == ""
 //====================================================
 
 if barstate.isconfirmed and lastStructure != ""
-    // UPTREND
     if lastStructure == "HH" or lastStructure == "HL"
         if not waitingForConfirmation and not na(structHH) and high > structHH
             pendingType := "HH"
             pendingIdx := bar_index
             waitingForConfirmation := true
+
         else if not waitingForConfirmation and not na(structHL) and low < structHL
             pendingType := "LL"
             pendingIdx := bar_index
@@ -619,12 +692,12 @@ if barstate.isconfirmed and lastStructure != ""
             waitingForConfirmation := false
             pendingType := ""
 
-    // DOWNTREND
     else if lastStructure == "LL" or lastStructure == "LH"
         if not waitingForConfirmation and not na(structLL) and low < structLL
             pendingType := "LL"
             pendingIdx := bar_index
             waitingForConfirmation := true
+
         else if not waitingForConfirmation and not na(structLH) and high > structLH
             pendingType := "HH"
             pendingIdx := bar_index
@@ -675,112 +748,132 @@ if barstate.isconfirmed and lastStructure != ""
             pendingType := ""
 
 //====================================================
-// 17. LATEST CONFIRMED STRUCTURAL HIGH / LOW
-//====================================================
-
-float nearestStructuralLow = na
-int nearestStructuralLowIndex = na
-
-if not na(structHL) and not na(structHL_idx)
-    nearestStructuralLow := structHL
-    nearestStructuralLowIndex := structHL_idx
-
-if not na(structLL) and not na(structLL_idx)
-    if na(nearestStructuralLowIndex) or structLL_idx > nearestStructuralLowIndex
-        nearestStructuralLow := structLL
-        nearestStructuralLowIndex := structLL_idx
-
-float nearestStructuralHigh = na
-int nearestStructuralHighIndex = na
-
-if not na(structHH) and not na(structHH_idx)
-    nearestStructuralHigh := structHH
-    nearestStructuralHighIndex := structHH_idx
-
-if not na(structLH) and not na(structLH_idx)
-    if na(nearestStructuralHighIndex) or structLH_idx > nearestStructuralHighIndex
-        nearestStructuralHigh := structLH
-        nearestStructuralHighIndex := structLH_idx
-
-//====================================================
-// 18. NY OPENING PRICES AND DAILY ATTEMPT STATE
+// 17. OPENING PRICES AND DAILY ATTEMPT STATE
 //====================================================
 
 var int trackedDateKey = na
 
 var float midnightOpen = na
-var float open830Price = na
-var float open930Price = na
+var float open830 = na
+var float open930 = na
+
+var int dailyAttemptCount = 0
 
 var bool liquiditySwept = false
 var int sweepBarIndex = na
 var float sweptStructurePrice = na
-var string sweptStructureName = ""
+var string sweptStructureType = ""
 
-var int dailyEntryCount = 0
-var int lastEntryBar = na
+// Store the original swept pivot's bar index and time.
+var int sweptStructureBarIndex = na
+var int sweptStructureTime = na
 
 if na(trackedDateKey) or dateKey != trackedDateKey
     trackedDateKey := dateKey
 
     midnightOpen := na
-    open830Price := na
-    open930Price := na
+    open830 := na
+    open930 := na
+
+    dailyAttemptCount := 0
 
     liquiditySwept := false
     sweepBarIndex := na
     sweptStructurePrice := na
-    sweptStructureName := ""
-
-    dailyEntryCount := 0
-    lastEntryBar := na
+    sweptStructureType := ""
+    sweptStructureBarIndex := na
+    sweptStructureTime := na
 
 if tradingDay
     if isMidnight
         midnightOpen := open
 
     if is830
-        open830Price := open
+        open830 := open
 
     if is930
-        open930Price := open
+        open930 := open
 
 //====================================================
-// 19. QUALIFYING STRUCTURE SWEEPS
+// 18. INDEPENDENT STRUCTURAL LEVEL QUALIFICATION
 //====================================================
 
-// SHORT SETUP:
-// Daily bias bearish.
-// Sweep an HH or LH.
-// The structure must be above at least one NY open.
-// The sweep candle must trade above the structure.
-//
-// LONG SETUP:
-// Daily bias bullish.
-// Sweep an LL or HL.
-// The structure must be below at least one NY open.
-// The sweep candle must trade below the structure.
+bool hhAboveOpen = not na(structHH) and (
+     (not na(midnightOpen) and structHH > midnightOpen) or
+     (not na(open830) and structHH > open830) or
+     (not na(open930) and structHH > open930))
+
+bool lhAboveOpen = not na(structLH) and (
+     (not na(midnightOpen) and structLH > midnightOpen) or
+     (not na(open830) and structLH > open830) or
+     (not na(open930) and structLH > open930))
+
+bool llBelowOpen = not na(structLL) and (
+     (not na(midnightOpen) and structLL < midnightOpen) or
+     (not na(open830) and structLL < open830) or
+     (not na(open930) and structLL < open930))
+
+bool hlBelowOpen = not na(structHL) and (
+     (not na(midnightOpen) and structHL < midnightOpen) or
+     (not na(open830) and structHL < open830) or
+     (not na(open930) and structHL < open930))
+
+//====================================================
+// 19. ACTUAL LIQUIDITY SWEEP CONDITIONS
+//====================================================
 
 bool after930 = nyHour > 9 or (nyHour == 9 and nyMinute >= 30)
 
-bool hhAboveOpen = (not na(midnightOpen) and not na(structHH) and structHH > midnightOpen) or (not na(open830Price) and not na(structHH) and structHH > open830Price) or (not na(open930Price) and not na(structHH) and structHH > open930Price)
+bool sweepPriceAboveOpen = (
+     (not na(midnightOpen) and high > midnightOpen) or
+     (not na(open830) and high > open830) or
+     (not na(open930) and high > open930))
 
-bool lhAboveOpen = (not na(midnightOpen) and not na(structLH) and structLH > midnightOpen) or (not na(open830Price) and not na(structLH) and structLH > open830Price) or (not na(open930Price) and not na(structLH) and structLH > open930Price)
+bool sweepPriceBelowOpen = (
+     (not na(midnightOpen) and low < midnightOpen) or
+     (not na(open830) and low < open830) or
+     (not na(open930) and low < open930))
 
-bool hlBelowOpen = (not na(midnightOpen) and not na(structHL) and structHL < midnightOpen) or (not na(open830Price) and not na(structHL) and structHL < open830Price) or (not na(open930Price) and not na(structHL) and structHL < open930Price)
+bool sweptHH = isM1 and barstate.isconfirmed and after930 and hhAboveOpen and sweepPriceAboveOpen and not na(structHH_idx) and high > structHH and high[1] <= structHH
 
-bool llBelowOpen = (not na(midnightOpen) and not na(structLL) and structLL < midnightOpen) or (not na(open830Price) and not na(structLL) and structLL < open830Price) or (not na(open930Price) and not na(structLL) and structLL < open930Price)
+bool sweptLH = isM1 and barstate.isconfirmed and after930 and lhAboveOpen and sweepPriceAboveOpen and not na(structLH_idx) and high > structLH and high[1] <= structLH
 
-bool sweepHH = not na(structHH) and not na(structHH_idx) and hhAboveOpen and high > structHH and high[1] <= structHH
-bool sweepLH = not na(structLH) and not na(structLH_idx) and lhAboveOpen and high > structLH and high[1] <= structLH
+bool sweptLL = isM1 and barstate.isconfirmed and after930 and llBelowOpen and sweepPriceBelowOpen and not na(structLL_idx) and low < structLL and low[1] >= structLL
 
-bool sweepHL = not na(structHL) and not na(structHL_idx) and hlBelowOpen and low < structHL and low[1] >= structHL
-bool sweepLL = not na(structLL) and not na(structLL_idx) and llBelowOpen and low < structLL and low[1] >= structLL
+bool sweptHL = isM1 and barstate.isconfirmed and after930 and hlBelowOpen and sweepPriceBelowOpen and not na(structHL_idx) and low < structHL and low[1] >= structHL
 
-bool bearishSweep = dailyBias == -1 and after930 and (sweepHH or sweepLH)
-bool bullishSweep = dailyBias == 1 and after930 and (sweepHL or sweepLL)
+// Select the most recently formed qualifying high pivot.
+float bearishSweepPrice = na
+int bearishSweepIndex = na
+string bearishSweepType = ""
 
-bool canStartAttempt = isM1 and tradingDay and barstate.isconfirmed and not liquiditySwept and dailyEntryCount < 3 and (na(lastEntryBar) or bar_index > lastEntryBar)
+if sweptHH
+    bearishSweepPrice := structHH
+    bearishSweepIndex := structHH_idx
+    bearishSweepType := "HH"
+
+if sweptLH and (na(bearishSweepIndex) or structLH_idx > bearishSweepIndex)
+    bearishSweepPrice := structLH
+    bearishSweepIndex := structLH_idx
+    bearishSweepType := "LH"
+
+// Select the most recently formed qualifying low pivot.
+float bullishSweepPrice = na
+int bullishSweepIndex = na
+string bullishSweepType = ""
+
+if sweptLL
+    bullishSweepPrice := structLL
+    bullishSweepIndex := structLL_idx
+    bullishSweepType := "LL"
+
+if sweptHL and (na(bullishSweepIndex) or structHL_idx > bullishSweepIndex)
+    bullishSweepPrice := structHL
+    bullishSweepIndex := structHL_idx
+    bullishSweepType := "HL"
+
+bool bearishSweep = dailyBias == -1 and (sweptHH or sweptLH)
+bool bullishSweep = dailyBias == 1 and (sweptLL or sweptHL)
 
 //====================================================
 // 20. M1 CANDIDATE FVG STORAGE
@@ -816,68 +909,35 @@ if isM1 and (na(m1CandidateDateKey) or dateKey != m1CandidateDateKey)
     array.clear(m1HistoryBottoms)
 
 //====================================================
-// 21. REGISTER A NEW SWEEP
+// 21. REGISTER CONFIRMED LIQUIDITY SWEEPS
 //====================================================
 
-if canStartAttempt and (bullishSweep or bearishSweep)
-    liquiditySwept := true
-    sweepBarIndex := bar_index
-
-    array.clear(candidateTops)
-    array.clear(candidateBottoms)
-    array.clear(candidateMids)
-    array.clear(candidateDirections)
-    array.clear(candidateTimes)
-    array.clear(candidateBars)
-    array.clear(candidateUsed)
-
+if isM1 and tradingDay and barstate.isconfirmed and after930 and dailyAttemptCount < maxDailyAttempts and not liquiditySwept
     if bearishSweep
-        if sweepHH and sweepLH
-            if structHH > structLH
-                sweptStructurePrice := structHH
-                sweptStructureName := "HH"
-            else
-                sweptStructurePrice := structLH
-                sweptStructureName := "LH"
-        else if sweepHH
-            sweptStructurePrice := structHH
-            sweptStructureName := "HH"
-        else
-            sweptStructurePrice := structLH
-            sweptStructureName := "LH"
+        liquiditySwept := true
+        sweepBarIndex := bar_index
+        sweptStructurePrice := bearishSweepPrice
+        sweptStructureType := bearishSweepType
+        sweptStructureBarIndex := bearishSweepIndex
+        sweptStructureTime := time[bar_index - bearishSweepIndex]
 
-    if bullishSweep
-        if sweepHL and sweepLL
-            if structHL < structLL
-                sweptStructurePrice := structHL
-                sweptStructureName := "HL"
-            else
-                sweptStructurePrice := structLL
-                sweptStructureName := "LL"
-        else if sweepHL
-            sweptStructurePrice := structHL
-            sweptStructureName := "HL"
-        else
-            sweptStructurePrice := structLL
-            sweptStructureName := "LL"
+    else if bullishSweep
+        liquiditySwept := true
+        sweepBarIndex := bar_index
+        sweptStructurePrice := bullishSweepPrice
+        sweptStructureType := bullishSweepType
+        sweptStructureBarIndex := bullishSweepIndex
+        sweptStructureTime := time[bar_index - bullishSweepIndex]
 
 //====================================================
 // 22. STORE QUALIFYING OPPOSING FVGs
 //====================================================
 
-// Bearish daily bias:
-// Store bullish FVGs as the opposing entry FVG.
-//
-// Bullish daily bias:
-// Store bearish FVGs as the opposing entry FVG.
-//
-// The FVG must form AFTER the liquidity sweep.
-// Overlapping FVGs are excluded.
-
 if isM1 and barstate.isconfirmed and (bullishFVG or bearishFVG)
     float detectedTop = bullishFVG ? bullTop : bearTop
     float detectedBottom = bullishFVG ? bullBottom : bearBottom
     float detectedMid = bullishFVG ? bullMid : bearMid
+
     int detectedDirection = bullishFVG ? 1 : -1
 
     bool overlapsExisting = false
@@ -897,10 +957,10 @@ if isM1 and barstate.isconfirmed and (bullishFVG or bearishFVG)
 
     bool formedAfterSweep = liquiditySwept and not na(sweepBarIndex) and bar_index - 2 > sweepBarIndex
 
-    bool validShortCandidate = detectedDirection == 1 and dailyBias == -1 and formedAfterSweep and not overlapsExisting
-    bool validLongCandidate = detectedDirection == -1 and dailyBias == 1 and formedAfterSweep and not overlapsExisting
+    bool validBullCandidate = detectedDirection == 1 and dailyBias == -1 and formedAfterSweep and not overlapsExisting
+    bool validBearCandidate = detectedDirection == -1 and dailyBias == 1 and formedAfterSweep and not overlapsExisting
 
-    if validShortCandidate or validLongCandidate
+    if validBullCandidate or validBearCandidate
         array.push(candidateTops, detectedTop)
         array.push(candidateBottoms, detectedBottom)
         array.push(candidateMids, detectedMid)
@@ -910,22 +970,35 @@ if isM1 and barstate.isconfirmed and (bullishFVG or bearishFVG)
         array.push(candidateUsed, false)
 
 //====================================================
-// 23. M1 ENTRY CONFIRMATION
+// 23. M1 ENTRY DRAWING STORAGE
 //====================================================
 
-// Only the MOST RECENT qualifying opposing FVG is used.
-//
-// Short:
-// Candle must close below the bullish FVG bottom.
-//
-// Long:
-// Candle must close above the bearish FVG top.
-//
-// Stop loss is the exact HH/LH or LL/HL that was swept.
-//
-// Maximum three confirmed entries per NY trading day.
+var array<box> todayEntryBoxes = array.new_box()
+var array<line> todayEntryMidpoints = array.new_line()
+var array<line> todayEntryLines = array.new_line()
+var array<line> todayStopLines = array.new_line()
+var array<label> todayEntryLabels = array.new_label()
+var array<label> todayStopLabels = array.new_label()
+var array<label> todayBiasLabels = array.new_label()
 
-if isM1 and barstate.isconfirmed and liquiditySwept and dailyEntryCount < 3
+var int entryDrawingDateKey = na
+
+if isM1 and (na(entryDrawingDateKey) or dateKey != entryDrawingDateKey)
+    array.clear(todayEntryBoxes)
+    array.clear(todayEntryMidpoints)
+    array.clear(todayEntryLines)
+    array.clear(todayStopLines)
+    array.clear(todayEntryLabels)
+    array.clear(todayStopLabels)
+    array.clear(todayBiasLabels)
+
+    entryDrawingDateKey := dateKey
+
+//====================================================
+// 24. M1 ENTRY CONFIRMATION
+//====================================================
+
+if isM1 and barstate.isconfirmed and liquiditySwept and dailyAttemptCount < maxDailyAttempts
     int selectedIndex = -1
 
     int count = array.size(candidateTops)
@@ -939,16 +1012,17 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyEntryCount < 3
             float top = array.get(candidateTops, i)
             float bottom = array.get(candidateBottoms, i)
 
-            bool shortConfirmation = direction == 1 and dailyBias == -1 and close < bottom
-            bool longConfirmation = direction == -1 and dailyBias == 1 and close > top
+            // Short: confirmed close completely below bullish FVG.
+            bool bearishConfirmation = dailyBias == -1 and direction == 1 and close < bottom and bar_index > formationBar
 
-            bool validConfirmation = not used and bar_index > formationBar and (shortConfirmation or longConfirmation)
+            // Long: confirmed close completely above bearish FVG.
+            bool bullishConfirmation = dailyBias == 1 and direction == -1 and close > top and bar_index > formationBar
 
-            if validConfirmation
+            if not used and (bearishConfirmation or bullishConfirmation)
                 selectedIndex := i
                 break
 
-    if selectedIndex >= 0 and not na(sweptStructurePrice)
+    if selectedIndex >= 0
         float top = array.get(candidateTops, selectedIndex)
         float bottom = array.get(candidateBottoms, selectedIndex)
         float mid = array.get(candidateMids, selectedIndex)
@@ -956,108 +1030,150 @@ if isM1 and barstate.isconfirmed and liquiditySwept and dailyEntryCount < 3
         int direction = array.get(candidateDirections, selectedIndex)
         int leftTime = array.get(candidateTimes, selectedIndex)
 
-        bool isLong = direction == -1
-
         float entryPrice = close
         float stopPrice = sweptStructurePrice
 
-        color zoneColor = direction == 1 ? bullishColor : bearishColor
-        color edgeColor = direction == 1 ? color.green : color.red
-        color midColor = direction == 1 ? bullishMidColor : bearishMidColor
+        // Only require that the stored structural stop exists.
+        // Do not let an additional directional test block the entry.
+        bool validStop = not na(stopPrice) and not na(sweptStructureBarIndex) and not na(sweptStructureTime)
 
-        // Draw ONLY the FVG used for this entry.
-        // The right edge is the next NY midnight.
-        box entryBox = box.new(
-             left=leftTime,
-             top=top,
-             right=nextMidnight,
-             bottom=bottom,
-             xloc=xloc.bar_time,
-             extend=extend.none,
-             bgcolor=zoneColor,
-             border_color=edgeColor,
-             border_width=2)
+        if validStop
+            array.set(candidateUsed, selectedIndex, true)
 
-        if showMidpoints
-            line.new(
-                 x1=leftTime,
-                 y1=mid,
-                 x2=nextMidnight,
-                 y2=mid,
+            dailyAttemptCount += 1
+
+            color zoneColor = direction == 1 ? bullishColor : bearishColor
+            color edgeColor = direction == 1 ? color.green : color.red
+            color midColor = direction == 1 ? bullishMidColor : bearishMidColor
+
+            // Draw only the FVG used for this confirmed entry.
+            box entryBox = box.new(
+                 left=leftTime,
+                 top=top,
+                 right=nextMidnight,
+                 bottom=bottom,
                  xloc=xloc.bar_time,
                  extend=extend.none,
-                 color=midColor,
-                 style=line.style_dashed,
-                 width=1)
+                 bgcolor=zoneColor,
+                 border_color=edgeColor,
+                 border_width=2)
 
-        // Three annotations per confirmed entry:
-        // 1. DAILY BIAS
-        // 2. ENTRY
-        // 3. STOP LOSS
+            array.push(todayEntryBoxes, entryBox)
 
-        string biasText = isLong ? "DAILY BIAS: BULLISH" : "DAILY BIAS: BEARISH"
-        string entryText = "ENTRY: " + str.tostring(entryPrice, format.mintick)
-        string stopText = "STOP LOSS: " + str.tostring(stopPrice, format.mintick)
+            if showMidpoints
+                line entryMid = line.new(
+                     x1=leftTime,
+                     y1=mid,
+                     x2=nextMidnight,
+                     y2=mid,
+                     xloc=xloc.bar_time,
+                     extend=extend.none,
+                     color=midColor,
+                     style=line.style_dashed,
+                     width=1)
 
-        label.new(
-             x=bar_index,
-             y=isLong ? low : high,
-             text=biasText,
-             xloc=xloc.bar_index,
-             yloc=yloc.price,
-             style=isLong ? label.style_label_up : label.style_label_down,
-             color=isLong ? color.new(color.green, 0) : color.new(color.red, 0),
-             textcolor=color.white,
-             size=size.normal)
+                array.push(todayEntryMidpoints, entryMid)
 
-        label.new(
-             x=bar_index,
-             y=entryPrice,
-             text=entryText,
-             xloc=xloc.bar_index,
-             yloc=yloc.price,
-             style=isLong ? label.style_label_up : label.style_label_down,
-             color=color.new(color.blue, 0),
-             textcolor=color.white,
-             size=size.normal)
+            // Entry price line begins at the actual entry candle.
+            line entryLine = line.new(
+                 x1=time,
+                 y1=entryPrice,
+                 x2=nextMidnight,
+                 y2=entryPrice,
+                 xloc=xloc.bar_time,
+                 extend=extend.none,
+                 color=color.white,
+                 width=2)
 
-        label.new(
-             x=bar_index,
-             y=stopPrice,
-             text=stopText,
-             xloc=xloc.bar_index,
-             yloc=yloc.price,
-             style=isLong ? label.style_label_down : label.style_label_up,
-             color=color.new(color.red, 0),
-             textcolor=color.white,
-             size=size.normal)
+            array.push(todayEntryLines, entryLine)
 
-        array.set(candidateUsed, selectedIndex, true)
+            // Stop-loss line begins at the original swept pivot candle.
+            line stopLine = line.new(
+                 x1=sweptStructureTime,
+                 y1=stopPrice,
+                 x2=nextMidnight,
+                 y2=stopPrice,
+                 xloc=xloc.bar_time,
+                 extend=extend.none,
+                 color=color.red,
+                 width=2,
+                 style=line.style_dashed)
 
-        dailyEntryCount += 1
-        lastEntryBar := bar_index
+            array.push(todayStopLines, stopLine)
 
-        // Reset sweep state so another qualifying setup
-        // can be taken, up to the daily maximum of three.
-        liquiditySwept := false
-        sweepBarIndex := na
-        sweptStructurePrice := na
-        sweptStructureName := ""
+            string directionText = direction == 1 ? "SHORT" : "LONG"
+            string biasText = direction == 1 ? "DAILY BIAS: BEARISH" : "DAILY BIAS: BULLISH"
 
-        array.clear(candidateTops)
-        array.clear(candidateBottoms)
-        array.clear(candidateMids)
-        array.clear(candidateDirections)
-        array.clear(candidateTimes)
-        array.clear(candidateBars)
-        array.clear(candidateUsed)
+            string entryText = "ENTRY " + str.tostring(dailyAttemptCount) + "/3\n" + directionText + "\nENTRY: " + str.tostring(entryPrice, format.mintick)
+
+            string stopText = "STOP LOSS\n" + str.tostring(stopPrice, format.mintick)
+
+            string structureText = "SWEPT: " + sweptStructureType
+
+            // Entry annotation is anchored to the confirmation candle.
+            label entryLabel = label.new(
+                 x=bar_index,
+                 y=entryPrice,
+                 text=entryText,
+                 xloc=xloc.bar_index,
+                 yloc=yloc.price,
+                 style=direction == 1 ? label.style_label_down : label.style_label_up,
+                 color=color.new(color.blue, 5),
+                 textcolor=color.white,
+                 size=size.normal)
+
+            array.push(todayEntryLabels, entryLabel)
+
+            // Stop annotation is anchored to the original swept pivot candle.
+            label stopLabel = label.new(
+                 x=sweptStructureBarIndex,
+                 y=stopPrice,
+                 text=stopText,
+                 xloc=xloc.bar_index,
+                 yloc=yloc.price,
+                 style=direction == 1 ? label.style_label_up : label.style_label_down,
+                 color=color.new(color.red, 5),
+                 textcolor=color.white,
+                 size=size.normal)
+
+            array.push(todayStopLabels, stopLabel)
+
+            // Bias annotation remains on the entry confirmation candle.
+            label biasLabel = label.new(
+                 x=bar_index,
+                 y=direction == 1 ? high : low,
+                 text=biasText + "\n" + structureText,
+                 xloc=xloc.bar_index,
+                 yloc=yloc.price,
+                 style=direction == 1 ? label.style_label_down : label.style_label_up,
+                 color=direction == 1 ? color.new(color.red, 5) : color.new(color.green, 5),
+                 textcolor=color.white,
+                 size=size.normal)
+
+            array.push(todayBiasLabels, biasLabel)
+
+            // Reset sweep state after a successful entry.
+            // A new structural sweep is required for the next setup.
+            liquiditySwept := false
+            sweepBarIndex := na
+            sweptStructurePrice := na
+            sweptStructureType := ""
+            sweptStructureBarIndex := na
+            sweptStructureTime := na
+
+            // Clear candidate FVGs so the next setup
+            // can only use FVGs formed after its new sweep.
+            array.clear(candidateTops)
+            array.clear(candidateBottoms)
+            array.clear(candidateMids)
+            array.clear(candidateDirections)
+            array.clear(candidateTimes)
+            array.clear(candidateBars)
+            array.clear(candidateUsed)
 
 //====================================================
-// 24. NEW YORK OPENING LEVELS
+// 25. NEW YORK OPENING LEVELS
 //====================================================
-
-// All three opening lines terminate at the next
-// New York midnight. They do not extend into tomorrow.
 
 if isM1 and showOpenLevels and tradingDay
     if isMidnight
@@ -1073,7 +1189,7 @@ if isM1 and showOpenLevels and tradingDay
 
     if is830
         line.new(
-             x1=midnight,
+             x1=timestamp(TZ, nyYear, nyMonth, nyDay, 8, 30),
              y1=open,
              x2=nextMidnight,
              y2=open,
@@ -1084,7 +1200,7 @@ if isM1 and showOpenLevels and tradingDay
 
     if is930
         line.new(
-             x1=midnight,
+             x1=timestamp(TZ, nyYear, nyMonth, nyDay, 9, 30),
              y1=open,
              x2=nextMidnight,
              y2=open,
@@ -1094,7 +1210,7 @@ if isM1 and showOpenLevels and tradingDay
              width=2)
 
 //====================================================
-// 25. OPENING PRICE MARKERS
+// 26. OPENING PRICE MARKERS
 //====================================================
 
 plot(showOpenLevels and isM1 and tradingDay and isMidnight ? open : na, title="00:00 NY Open", color=midnightColor, style=plot.style_circles, linewidth=2)
